@@ -602,26 +602,95 @@ $$\phi = 0$$
 
 ### 13.1 输入坐标
 
-每个 token 可以附带以下坐标：
+Harmonic RoPE 的设计并不要求输入必须是离散 MIDI pitch。MIDI 编号很适合作为早期实现配置，因为它简单、稳定、方便与现有 MusicXML / MIDI / symbolic dataset 对齐。但从设计初衷上，Harmonic RoPE 更适合被理解为一种基于真实频率或对数频率的连续坐标编码。
+
+也就是说，一个音高 token 可以附带的核心坐标不是必须为：
+
+`pitch_id = MIDI pitch`
+
+而可以更一般地表示为：
+
+```text
+frequency_hz        # 真实频率，例如 440.0 Hz
+log_freq_coord      # 对数频率坐标，例如 log2(f / f_ref)
+pitch_coord         # 可选：由 log_freq_coord 映射得到的连续或离散音高坐标
+
+```
+
+在十二平均律中，MIDI pitch 可以看作对数频率坐标的一种离散化形式。若以 A4 = 440 Hz，对应 MIDI 69，则有：
+
+$$p = 69 + 12 \log_2 \frac{f}{440}$$
+
+当 $f$ 恰好来自十二平均律时，$p$ 通常是整数；当输入来自真实演奏、微分音、非十二平均律或连续频率估计时，$p$ 可以是小数。
+
+因此，初期实现可以使用 MIDI pitch，但模型结构本身不应依赖 MIDI 的离散性。
+
+在默认的十二平均律配置下，每个 token 可以附带以下坐标：
 
 ```text
 time_id             # rational / fractional musical time
-pitch_id            # MIDI pitch or canonical pitch id
-pitch_class_id      # pitch_id % 12
-fifth_id            # circle-of-fifths index
+frequency_hz        # optional: real frequency, if available
+log_freq_coord      # log2(f / f_ref), continuous pitch coordinate
+pitch_id            # optional: MIDI pitch or MIDI-like continuous pitch
+pitch_class_id      # optional: pitch_id % 12, for 12-TET only
+fifth_id            # optional: circle-of-fifths index, for 12-TET functional space
 voice_id            # voice / part index
 token_type          # NOTE, DUR, BAR, BEAT, SUST, EXT, etc.
 
 ```
 
-对于非音高 token，可以采用：
+其中：
+
+* `pitch_id`
+* `pitch_class_id`
+* `fifth_id`
+
+都应被视为十二平均律下的便捷实现，而不是 Harmonic RoPE 的理论前提。
+
+现代西方音乐的大部分符号数据默认使用十二平均律。十二平均律的一个重要特点是具有平移不变性：任意旋律或和声结构整体移调后，其音程结构保持不变。因此，使用：
+
+* `pitch_id % 12`
+* `circle-of-fifths index`
+
+可以很好地服务于常见调性音乐建模。
+
+但音乐系统并不总是十二平均律。历史音乐、民族音乐、现代音乐、实验音乐和微分音音乐中都可能出现：
+
+* 非 12 音划分
+* 非等分音阶
+* 非对称律制
+* 不具备简单移调不变性的音高系统
+* 真实频率偏移
+* 演奏 intonation drift
+
+因此，更通用的实现方式应允许用户自定义 harmonic coordinate mapping：
+
+`frequency_hz / log_freq_coord -> harmonic_coord`
+
+例如：
 
 ```text
+12-TET:
+    harmonic_coord = MIDI-like pitch coordinate
+
+24-TET:
+    harmonic_coord = 24 * log2(f / f_ref)
+
+just intonation:
+    harmonic_coord = ratio-based or prime-factor coordinate
+
+custom tuning:
+    harmonic_coord = user-defined pitch-space coordinate
+
+```
+
+这样 Harmonic RoPE 不依赖某一种固定律制，而是可以复用到不同 tuning system 中。
+
+对于非音高 token，可以采用：
+
 1. harmonic phase = 0
 2. inherit previous pitch coordinate
 3. inherit current beat/chord coordinate
-
-```
 
 初期建议使用最简单稳定的策略：
 
@@ -630,37 +699,80 @@ non-pitch token: harmonic phase = 0
 
 ```
 
-这样可以避免引入复杂状态传播。
-
----
+这样可以避免引入复杂状态传播，也能保证不同 token 类型之间的行为足够可控。
 
 ### 13.2 Phase construction
+
+Harmonic RoPE 的 phase construction 可以从连续频率坐标出发，再根据当前配置映射到不同 harmonic subspace。
 
 伪代码如下：
 
 ```python
 def build_music_rope_phase(
     time_coord,
-    pitch_coord,
-    pitch_class_coord,
-    fifth_coord,
-    rotary_dim,
+    frequency_hz=None,
+    log_freq_coord=None,
+    pitch_coord=None,
+    pitch_class_coord=None,
+    fifth_coord=None,
+    tuning_config=None,
+    rotary_dim=None,
 ):
     phase = zeros(rotary_dim // 2)
 
+    # ------------------------------------------------------------
+    # 0. Build pitch / harmonic coordinates
+    # ------------------------------------------------------------
+    # The model does not require discrete MIDI pitch.
+    # MIDI-like pitch is only one possible coordinate system.
+    if log_freq_coord is None and frequency_hz is not None:
+        log_freq_coord = log2(frequency_hz / tuning_config.f_ref)
+
+    if pitch_coord is None and log_freq_coord is not None:
+        # In 12-TET, this is equivalent to continuous MIDI-like pitch.
+        pitch_coord = tuning_config.pitch_scale * log_freq_coord + tuning_config.pitch_offset
+
+    if pitch_class_coord is None and tuning_config.use_pitch_class:
+        # Usually only valid for 12-TET or other explicitly periodic systems.
+        pitch_class_coord = pitch_coord % tuning_config.period
+
+    if fifth_coord is None and tuning_config.use_fifths:
+        # Usually only valid for 12-TET or a defined functional lattice.
+        fifth_coord = tuning_config.to_fifth_coord(pitch_class_coord)
+
+    # ------------------------------------------------------------
     # 1. temporal-only subspace
+    # ------------------------------------------------------------
     phase[temp_slice] = omega_time * time_coord
 
+    # ------------------------------------------------------------
     # 2. coupled temporal-harmonic subspace
+    # ------------------------------------------------------------
+    # This subspace models interval function in time.
+    # In 12-TET, fifth_coord or pitch_class_coord can be used.
+    # In other tuning systems, this can be replaced by any user-defined
+    # harmonic coordinate.
     phase[coupled_slice] = (
         omega_time_coupled * time_coord
-        + omega_harmonic * fifth_coord
+        + omega_harmonic * tuning_config.harmonic_coord(
+            pitch_coord=pitch_coord,
+            pitch_class_coord=pitch_class_coord,
+            fifth_coord=fifth_coord,
+            log_freq_coord=log_freq_coord,
+        )
     )
 
+    # ------------------------------------------------------------
     # 3. pure long-range harmonic subspace
+    # ------------------------------------------------------------
+    # This subspace preserves pitch direction and register distance.
+    # It should usually use continuous pitch/log-frequency coordinates,
+    # not pitch class.
     phase[range_slice] = omega_range * pitch_coord
 
+    # ------------------------------------------------------------
     # 4. identity/content subspace
+    # ------------------------------------------------------------
     phase[identity_slice] = 0.0
 
     return phase
@@ -670,11 +782,28 @@ def build_music_rope_phase(
 其中：
 
 * `omega_time` 使用类似普通 RoPE 的多频率设计；
-* `omega_harmonic` 可以使用八度周期、五度圈周期或其组合；
-* `omega_range` 使用较低频率，覆盖常见音域；
-* `identity_slice` 不旋转。
+* `omega_harmonic` 可以使用八度周期、五度圈周期或用户自定义 tuning 周期；
+* `omega_range` 使用较低频率，覆盖常见音域，用于保留音高方向与 register distance；
+* `identity_slice` 不旋转，用于保留普通 token 内容表达；
+* `tuning_config` 负责把真实频率、对数频率或 MIDI-like pitch 映射到当前律制下的 harmonic coordinate。
 
----
+在十二平均律中，可以使用：
+
+```python
+pitch_coord = MIDI-like pitch
+pitch_class_coord = pitch_coord % 12
+fifth_coord = circle_of_fifths[pitch_class_coord]
+
+```
+
+在非十二平均律中，则不应强行使用 `pitch_id % 12`，而应改为：
+
+```python
+harmonic_coord = tuning_config.harmonic_coord(log_freq_coord)
+
+```
+
+这样可以保证 Harmonic RoPE 在不同律制下仍然复用同一套 phase construction 框架。
 
 ### 13.3 KV cache
 
@@ -690,7 +819,7 @@ kv_cache.append(k, v)
 
 这样历史 key 不需要在每一步重新计算 harmonic phase。
 
-由于 harmonic coordinate 是离散的，也可以预计算 phase cache：
+如果 harmonic coordinate 是离散的，例如十二平均律 MIDI / pitch class / fifth index，则可以预计算 phase cache：
 
 ```text
 time_coord -> temporal phase
@@ -701,6 +830,23 @@ pitch_id -> range phase
 ```
 
 推理时只需要查表并相加。
+
+如果输入是连续频率或非十二平均律坐标，则 phase 不一定能完全离散查表。此时可以采用两种方式：
+
+1. 直接根据 `log_freq_coord` 实时计算 phase
+2. 对连续频率坐标做高精度量化后缓存 phase
+
+例如：
+
+```text
+log_freq_coord -> continuous harmonic phase
+quantized_log_freq_coord -> cached harmonic phase
+
+```
+
+因此，phase cache 是一种工程优化，而不是 Harmonic RoPE 的理论前提。
+
+Harmonic RoPE 的核心只要求每个音高事件能够映射到某种 harmonic coordinate；这个 coordinate 可以来自 MIDI，也可以来自真实频率、连续音高估计或任意自定义律制。
 
 ---
 
