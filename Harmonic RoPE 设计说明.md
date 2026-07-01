@@ -151,7 +151,10 @@ $$m = 0, 1, 2, 3, \dots$$
 例如，以下 token 在线性序列中可能相隔较远：
 
 ```text
-BAR_1 BEAT_1 V1 C4 DUR_1/4 V2 E3 DUR_1/4 V3 G3 DUR_1/4
+BAR 
+BEAT_1 V1 C4 DUR_16 
+V2 E3 DUR_16 
+V3 G3 DUR_16
 
 ```
 
@@ -337,7 +340,7 @@ $$\Delta \phi_{th} = \omega_t \cdot 1 + \omega_h \Delta h$$
 
 ## 7. 为什么时间相位是重要的修正项？
 
-Temporal RoPE 的旋转速度通常较慢。
+Temporal RoPE 的旋转速度通常很慢。
 它不会在短时间内快速跨越多个周期，而是提供一种稳定、平滑的时间坐标。
 
 Harmonic RoPE 的旋转速度则可以很快。
